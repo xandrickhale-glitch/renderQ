@@ -339,5 +339,5 @@ with st.expander("📜 Logs", expanded=False):
 # Footer
 # =========================
 st.markdown("---")
-st.caption("Created by @effands with Ai | visit ziqva.com - since agust 2025.")
+st.caption("Created by @effands with Ai | ziqva.com - since agust 2025. CP 0856 4990 5055")
 st.caption(f"Terakhir diupdate: {datetime.now().strftime('%d %B %Y %H:%M:%S')}")
