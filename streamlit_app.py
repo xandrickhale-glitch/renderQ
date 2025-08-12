@@ -412,5 +412,5 @@ with st.expander("📜 Logs", expanded=False):
 # =========================
 st.markdown("---")
 st.caption("Created by @effands with Ai | ziqva.com - @2025")
-st.captioon("kontak : 0856 4990 5055")
+st.caption("kontak : 0856 4990 5055")
 st.caption(f"Terakhir diupdate: {datetime.now().strftime('%d %B %Y %H:%M:%S')}")
