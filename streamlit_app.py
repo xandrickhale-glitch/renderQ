@@ -1,151 +1,343 @@
+# app_veo_gemini_advanced.py
+# Streamlit • Veo 2 / Veo 3 via Gemini API (API key only)
+# - Advanced-only UI, compact 2-column layout
+# - Thin outlined groups (expanders styled like cards)
+# - Batch prompts, LRO polling, MP4 download & preview
+# - Rotating log + viewer
+# pip install streamlit requests
+
+import os
+import time
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+import requests
 import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# =========================
+# Page & Global Config
+# =========================
+st.set_page_config(page_title="RenderX Veo Gemini", layout="wide")
+BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Compact CSS + thin outline for groups
+st.markdown("""
+<style>
+:root {
+  --card-border-light: rgba(0,0,0,.12);
+  --card-border-dark: rgba(255,255,255,.15);
+}
+html:not(.dark) details { border:1px solid var(--card-border-light); }
+html.dark details { border:1px solid var(--card-border-dark); }
+details {
+  border-radius: 12px; padding: 10px 12px; margin-bottom: 10px;
+}
+details > summary {
+  font-weight: 600; font-size: 0.95rem; margin-bottom: 6px; cursor: pointer;
+}
+.block-container { padding-top: 1.2rem; }
+h1, h2, h3 { margin-bottom: .4rem; }
+.small-note { opacity:.7; font-size:.9rem; }
+.cardpad { padding: 4px 6px 2px 6px; }
+</style>
+""", unsafe_allow_html=True)
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+st.title("🎬 RenderX Veo Gemini")
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+# =========================
+# Session Defaults
+# =========================
+if "prompts" not in st.session_state:
+    st.session_state.prompts = []
+if "results" not in st.session_state:
+    st.session_state.results = []
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+# =========================
+# Logging
+# =========================
+def setup_logger(log_path: str | None, level=logging.INFO):
+    logger = logging.getLogger("veo_gemini_adv")
+    logger.setLevel(level)
+    logger.propagate = False
+    if logger.handlers:  # avoid duplicate handlers on rerun
+        return logger
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt); ch.setLevel(level)
+    logger.addHandler(ch)
+    if log_path:
+        try:
+            fh = RotatingFileHandler(log_path, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+            fh.setFormatter(fmt); fh.setLevel(level)
+            logger.addHandler(fh)
+        except Exception as e:
+            st.warning(f"⚠️ Log file gagal dibuat: {e}")
+    return logger
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+def tail_file(path: str, max_bytes: int = 60_000) -> str:
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+            return f.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        return f"(Tidak dapat membaca log: {e})"
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+# =========================
+# Top Row: API+Output | Model+Params
+# =========================
+colL, colR = st.columns(2, gap="small")
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+with colL:
+    with st.expander("🔑 API & Output", expanded=True):
+        api_key = st.text_input("Gemini API Key (format AIza…)", type="password")
+        default_out = os.path.join(os.path.expanduser("~"), "Downloads", "VEO_OUTPUT")
+        output_folder = st.text_input("Folder output", value=default_out)
+        os.makedirs(output_folder, exist_ok=True)
 
-    return gdp_df
+        use_file_log = st.toggle("Aktifkan file log", value=True)
+        log_level = st.selectbox("Level Log", ["INFO", "DEBUG", "WARNING", "ERROR"], index=0)
+        log_file = os.path.join(output_folder, "veo_gemini_advanced.log") if use_file_log else None
+        logger = setup_logger(log_file, getattr(logging, log_level))
 
-gdp_df = get_gdp_data()
+        st.caption("API key bisa dibuat dari Google AI Studio atau `gcloud services api-keys create`.")
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
+with colR:
+    with st.expander("🎛️ Model & Parameters", expanded=True):
+        model = st.selectbox(
+            "Model",
+            [
+                "veo-3.0-fast-generate-preview",  # cepat, 8s, 16:9, audio on
+                "veo-3.0-generate-preview",       # 8s, 16:9, audio on
+                "veo-2.0-generate-001",           # 5–8s, 16:9/9:16, silent
+            ],
+            index=0
         )
+
+        # Aspect ratio & duration rules
+        if model.startswith("veo-3."):
+            aspect_ratio = st.selectbox("Aspect Ratio", ["16:9"], index=0)
+            st.markdown('<div class="small-note">Veo 3 preview: 16:9 & 8 detik (audio on).</div>', unsafe_allow_html=True)
+            duration_seconds = 8
+        else:
+            aspect_ratio = st.selectbox("Aspect Ratio (Veo 2)", ["16:9", "9:16"], index=0)
+            duration_seconds = st.selectbox("Durasi (detik, Veo 2)", [5, 6, 7, 8], index=3)
+
+        c1, c2 = st.columns(2, gap="small")
+        with c1:
+            negative_prompt = st.text_input("Negative Prompt (opsional)", value="")
+        with c2:
+            person_generation = st.selectbox(
+                "Person Generation (opsional)",
+                ["(default)", "allow_all", "allow_adult", "dont_allow"],
+                index=0,
+                help="Tergantung region & model. Biarkan default jika ragu."
+            )
+            if person_generation == "(default)":
+                person_generation = None
+
+# =========================
+# Prompts (Full width, compact)
+# =========================
+with st.expander("📝 Prompts", expanded=True):
+    cA, cB = st.columns([2, 1], gap="small")
+    with cA:
+        multi = st.text_area("Tambahkan beberapa prompt (1 baris = 1 prompt)", height=160, placeholder="Contoh: An ultra wide cinematic shot of ...")
+        if st.button("➕ Tambah dari teks di atas"):
+            lines = [l.strip() for l in multi.splitlines() if l.strip()]
+            st.session_state.prompts.extend(lines)
+            st.success(f"Ditambahkan {len(lines)} prompt.")
+
+    with cB:
+        txt = st.file_uploader("Upload .txt (1/baris)", type=["txt"])
+        if txt:
+            lines = txt.read().decode("utf-8", errors="ignore").splitlines()
+            lines = [l.strip() for l in lines if l.strip()]
+            st.session_state.prompts.extend(lines)
+            st.success(f"Ditambahkan {len(lines)} prompt dari file.")
+        if st.button("🧹 Bersihkan semua prompt"):
+            st.session_state.prompts = []
+            st.success("Prompt dibersihkan.")
+
+    if st.session_state.prompts:
+        st.caption(f"Total prompt: {len(st.session_state.prompts)}")
+        with st.container():
+            for i, p in enumerate(st.session_state.prompts, start=1):
+                st.text(f"{i}. {p}")
+
+# =========================
+# Gemini REST Helpers
+# =========================
+def start_generation(api_key: str, model: str, prompt: str,
+                     aspect_ratio: str, negative_prompt: str | None,
+                     person_generation: str | None,
+                     duration_seconds: int | None) -> tuple[bool, str]:
+    """Kick off Veo via Gemini API (predictLongRunning). Returns (ok, operation_name_or_error)"""
+    url = f"{BASE_URL}/models/{model}:predictLongRunning"
+    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+    params = {"aspectRatio": aspect_ratio}
+    if model.startswith("veo-2.") and duration_seconds:
+        params["durationSeconds"] = int(duration_seconds)
+    if negative_prompt:
+        params["negativePrompt"] = negative_prompt
+    if person_generation:
+        params["personGeneration"] = person_generation
+
+    body = {"instances": [{"prompt": prompt}], "parameters": params}
+
+    logger.info(f"Kickoff -> model={model} aspect={aspect_ratio} dur={params.get('durationSeconds','8')} prompt='{prompt[:80]}'")
+    resp = requests.post(url, headers=headers, data=json.dumps(body))
+    if resp.status_code != 200:
+        logger.error(f"Kickoff FAIL {resp.status_code}: {resp.text}")
+        return False, f"{resp.status_code}: {resp.text}"
+    data = resp.json()
+    op_name = data.get("name")
+    if not op_name:
+        logger.error(f"Kickoff BAD RESPONSE: {data}")
+        return False, f"Bad response: {data}"
+    logger.info(f"Kickoff OK operation={op_name}")
+    return True, op_name
+
+def poll_operation(api_key: str, operation_name: str, timeout: int = 900, every: int = 5) -> tuple[bool, dict | str]:
+    """Poll until done. Returns (ok, response_dict_or_error_str)."""
+    url = f"{BASE_URL}/{operation_name}"
+    headers = {"x-goog-api-key": api_key}
+    start = time.time()
+    progress = st.progress(0, text="Menunggu hasil (polling)…")
+
+    while True:
+        r = requests.get(url, headers=headers)
+        if r.status_code != 200:
+            logger.error(f"Poll FAIL {r.status_code}: {r.text}")
+            progress.empty()
+            return False, f"{r.status_code}: {r.text}"
+        j = r.json()
+        if j.get("done"):
+            logger.info("Poll DONE")
+            progress.progress(100, text="Selesai.")
+            time.sleep(0.25)
+            progress.empty()
+            return True, j
+
+        elapsed = time.time() - start
+        pct = min(int((elapsed / timeout) * 100), 99)
+        progress.progress(pct, text=f"Polling… ({pct}%)")
+        logger.debug(f"Poll running… elapsed={int(elapsed)}s")
+        if elapsed > timeout:
+            logger.error("Poll TIMEOUT")
+            progress.empty()
+            return False, "Timeout polling operation."
+        time.sleep(every)
+
+def download_video_by_uri(api_key: str, uri: str, out_path: str) -> tuple[bool, str]:
+    """Download the video using URI from operation response."""
+    headers = {"x-goog-api-key": api_key}
+    logger.info(f"Download -> {uri} -> {out_path}")
+    try:
+        with requests.get(uri, headers=headers, stream=True, allow_redirects=True) as r:
+            if r.status_code != 200:
+                logger.error(f"Download FAIL {r.status_code}: {r.text}")
+                return False, f"{r.status_code}: {r.text}"
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        logger.info("Download OK")
+        return True, out_path
+    except Exception as e:
+        logger.exception(f"Download EXCEPTION: {e}")
+        return False, str(e)
+
+# =========================
+# Run Row & Results
+# =========================
+with st.expander("🚀 Jalankan & Hasil", expanded=True):
+    runL, runR = st.columns([1, 3], gap="small")
+    with runL:
+        go = st.button("🎬 Generate Batch", use_container_width=True)
+    with runR:
+        st.caption("Video akan diunduh & dipreview otomatis. Lihat log jika ada error.")
+
+    if go:
+        if not api_key:
+            st.error("Masukkan API key dulu.")
+        elif not st.session_state.prompts:
+            st.error("Tambah minimal 1 prompt.")
+        else:
+            st.session_state.results = []
+            status = st.empty()
+            for i, prompt in enumerate(st.session_state.prompts, start=1):
+                status.text(f"Mulai job {i}/{len(st.session_state.prompts)} …")
+                logger.info(f"=== JOB {i} START ===")
+                ok, op_or_err = start_generation(
+                    api_key=api_key,
+                    model=model,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                    negative_prompt=negative_prompt,
+                    person_generation=person_generation,
+                    duration_seconds=duration_seconds if model.startswith("veo-2.") else None
+                )
+                if not ok:
+                    st.error(f"Kickoff gagal: {op_or_err}")
+                    st.session_state.results.append({"index": i, "status": "ERROR", "info": op_or_err, "prompt": prompt})
+                    logger.info(f"=== JOB {i} END (kickoff error) ===")
+                    continue
+
+                op_name = op_or_err
+                ok, resp = poll_operation(api_key, op_name, timeout=900, every=5)
+                if not ok:
+                    st.error(f"Gagal polling: {resp}")
+                    st.session_state.results.append({"index": i, "status": "ERROR", "info": str(resp), "prompt": prompt})
+                    logger.info(f"=== JOB {i} END (poll error) ===")
+                    continue
+
+                # Parse URI
+                try:
+                    uri = resp["response"]["generateVideoResponse"]["generatedSamples"][0]["video"]["uri"]
+                except Exception as e:
+                    st.error(f"Respon selesai tapi tidak ada URI: {e}")
+                    st.session_state.results.append({"index": i, "status": "ERROR", "info": "No URI in response", "prompt": prompt})
+                    logger.info(f"=== JOB {i} END (no uri) ===")
+                    continue
+
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                fname = f"veo_{i}_{ts}.mp4"
+                out_path = os.path.join(output_folder, fname)
+                ok, msg = download_video_by_uri(api_key, uri, out_path)
+                if ok:
+                    st.success(f"✅ Video {i} tersimpan: {out_path}")
+                    st.video(out_path)
+                    st.session_state.results.append({"index": i, "status": "OK", "info": out_path, "prompt": prompt})
+                else:
+                    st.error(f"Download gagal: {msg}")
+                    st.session_state.results.append({"index": i, "status": "ERROR", "info": msg, "prompt": prompt})
+
+                logger.info(f"=== JOB {i} END ===")
+
+            status.empty()
+            st.markdown("---")
+            st.subheader("📊 Ringkasan")
+            for r in st.session_state.results:
+                emoji = "✅" if r["status"] == "OK" else "❌"
+                st.write(f"{r['index']}. {emoji} {r['status']} — {r['info']}")
+
+# =========================
+# Logs (Collapsed by default)
+# =========================
+with st.expander("📜 Logs", expanded=False):
+    if use_file_log and log_file and os.path.exists(log_file):
+        if st.button("Muat Log Terbaru"):
+            st.text_area("Tail Log", tail_file(log_file), height=280)
+        st.caption(log_file)
+    else:
+        st.caption("File log belum tersedia atau logging dimatikan.")
+
+# =========================
+# Footer
+# =========================
+st.markdown("---")
+st.caption("Created by @effands with Ai | visit ziqva.com - since agust 2025.")
+st.caption(f"Terakhir diupdate: {datetime.now().strftime('%d %B %Y %H:%M:%S')}")
