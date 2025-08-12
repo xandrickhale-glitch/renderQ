@@ -12,13 +12,15 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
 import requests
 import streamlit as st
 
 # =========================
 # Page & Global Config
 # =========================
-st.set_page_config(page_title="RenderX Veo Gemini", layout="wide")
+st.set_page_config(page_title="RenderX Veo", layout="wide")
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 # Compact CSS + thin outline for groups
@@ -43,7 +45,7 @@ h1, h2, h3 { margin-bottom: .4rem; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎬 RenderX Veo Gemini")
+st.title("🎬 RenderX Veo")
 
 # =========================
 # Session Defaults
@@ -174,7 +176,9 @@ def start_generation(api_key: str, model: str, prompt: str,
                      aspect_ratio: str, negative_prompt: str | None,
                      person_generation: str | None,
                      duration_seconds: int | None) -> tuple[bool, str]:
-    """Kick off Veo via Gemini API (predictLongRunning). Returns (ok, operation_name_or_error)"""
+    """
+    Kick off Veo via Gemini API (predictLongRunning). Returns (ok, operation_name_or_error)
+    """
     url = f"{BASE_URL}/models/{model}:predictLongRunning"
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
     params = {"aspectRatio": aspect_ratio}
@@ -188,7 +192,7 @@ def start_generation(api_key: str, model: str, prompt: str,
     body = {"instances": [{"prompt": prompt}], "parameters": params}
 
     logger.info(f"Kickoff -> model={model} aspect={aspect_ratio} dur={params.get('durationSeconds','8')} prompt='{prompt[:80]}'")
-    resp = requests.post(url, headers=headers, data=json.dumps(body))
+    resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=90)
     if resp.status_code != 200:
         logger.error(f"Kickoff FAIL {resp.status_code}: {resp.text}")
         return False, f"{resp.status_code}: {resp.text}"
@@ -201,14 +205,22 @@ def start_generation(api_key: str, model: str, prompt: str,
     return True, op_name
 
 def poll_operation(api_key: str, operation_name: str, timeout: int = 900, every: int = 5) -> tuple[bool, dict | str]:
-    """Poll until done. Returns (ok, response_dict_or_error_str)."""
+    """
+    Poll until done. Returns (ok, response_dict_or_error_str).
+    """
     url = f"{BASE_URL}/{operation_name}"
     headers = {"x-goog-api-key": api_key}
     start = time.time()
     progress = st.progress(0, text="Menunggu hasil (polling)…")
 
     while True:
-        r = requests.get(url, headers=headers)
+        try:
+            r = requests.get(url, headers=headers, timeout=60)
+        except Exception as e:
+            logger.error(f"Poll EXCEPTION: {e}")
+            progress.empty()
+            return False, f"Exception: {e}"
+
         if r.status_code != 200:
             logger.error(f"Poll FAIL {r.status_code}: {r.text}")
             progress.empty()
@@ -231,19 +243,71 @@ def poll_operation(api_key: str, operation_name: str, timeout: int = 900, every:
             return False, "Timeout polling operation."
         time.sleep(every)
 
-def download_video_by_uri(api_key: str, uri: str, out_path: str) -> tuple[bool, str]:
-    """Download the video using URI from operation response."""
-    headers = {"x-goog-api-key": api_key}
-    logger.info(f"Download -> {uri} -> {out_path}")
+# ---------- URI helpers (fix for redirects/auth) ----------
+def _append_key(u: str, key: str) -> str:
+    """
+    Put the API key in the query string so auth survives cross-host redirects.
+    """
+    parts = list(urlparse(u))
+    q = dict(parse_qsl(parts[4]))
+    q["key"] = key
+    parts[4] = urlencode(q)
+    return urlunparse(parts)
+
+def extract_video_uri(op_json: dict) -> str | None:
+    """
+    Supports both current (generatedVideos) and older (generateVideoResponse.generatedSamples)
+    response shapes, and returns a downloadable URI (without the key).
+    """
+    r = op_json.get("response", {}) or {}
+
+    # Newer shape
     try:
-        with requests.get(uri, headers=headers, stream=True, allow_redirects=True) as r:
+        v = r["generatedVideos"][0]["video"]
+        uri = v.get("uri") or v.get("fileUri")
+        if uri:
+            return uri
+    except Exception:
+        pass
+
+    # Older/preview shape
+    try:
+        v = r["generateVideoResponse"]["generatedSamples"][0]["video"]
+        uri = v.get("uri") or v.get("fileUri")
+        if uri:
+            return uri
+    except Exception:
+        pass
+
+    return None
+
+def download_video_by_uri(api_key: str, uri: str, out_path: str) -> tuple[bool, str]:
+    """
+    Download the video using the URI from the operation response.
+    IMPORTANT: add ?key=... so auth survives cross-host redirects.
+    """
+    dl_url = _append_key(uri, api_key)
+
+    logger.info(f"Download -> {dl_url} -> {out_path}")
+    try:
+        with requests.Session() as s:
+            r = s.get(dl_url, stream=True, allow_redirects=True, timeout=300)
             if r.status_code != 200:
-                logger.error(f"Download FAIL {r.status_code}: {r.text}")
-                return False, f"{r.status_code}: {r.text}"
+                ct = r.headers.get("content-type", "")
+                msg = r.text if "application/json" in ct or "text" in ct else f"HTTP {r.status_code}"
+                logger.error(f"Download FAIL {r.status_code}: {msg}")
+                return False, msg
+
+            ct = r.headers.get("content-type", "")
+            if "video" not in ct and "octet-stream" not in ct:
+                logger.warning(f"Unexpected content-type during download: {ct}")
+
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
             with open(out_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
+
         logger.info("Download OK")
         return True, out_path
     except Exception as e:
@@ -294,11 +358,10 @@ with st.expander("🚀 Jalankan & Hasil", expanded=True):
                     logger.info(f"=== JOB {i} END (poll error) ===")
                     continue
 
-                # Parse URI
-                try:
-                    uri = resp["response"]["generateVideoResponse"]["generatedSamples"][0]["video"]["uri"]
-                except Exception as e:
-                    st.error(f"Respon selesai tapi tidak ada URI: {e}")
+                # Parse URI (robust to new/old response shapes)
+                uri = extract_video_uri(resp)
+                if not uri:
+                    st.error("Respon selesai tapi tidak ada URI video yang bisa diunduh.")
                     st.session_state.results.append({"index": i, "status": "ERROR", "info": "No URI in response", "prompt": prompt})
                     logger.info(f"=== JOB {i} END (no uri) ===")
                     continue
@@ -306,10 +369,19 @@ with st.expander("🚀 Jalankan & Hasil", expanded=True):
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 fname = f"veo_{i}_{ts}.mp4"
                 out_path = os.path.join(output_folder, fname)
+
                 ok, msg = download_video_by_uri(api_key, uri, out_path)
                 if ok:
                     st.success(f"✅ Video {i} tersimpan: {out_path}")
                     st.video(out_path)
+
+                    # Optional: client download button (useful if app berjalan di server)
+                    try:
+                        with open(out_path, "rb") as f:
+                            st.download_button("⬇️ Download MP4", f, file_name=os.path.basename(out_path), mime="video/mp4", key=f"dl_{i}_{ts}")
+                    except Exception as e:
+                        logger.warning(f"Gagal membuat tombol download: {e}")
+
                     st.session_state.results.append({"index": i, "status": "OK", "info": out_path, "prompt": prompt})
                 else:
                     st.error(f"Download gagal: {msg}")
@@ -328,7 +400,7 @@ with st.expander("🚀 Jalankan & Hasil", expanded=True):
 # Logs (Collapsed by default)
 # =========================
 with st.expander("📜 Logs", expanded=False):
-    if use_file_log and log_file and os.path.exists(log_file):
+    if 'use_file_log' in locals() and use_file_log and log_file and os.path.exists(log_file):
         if st.button("Muat Log Terbaru"):
             st.text_area("Tail Log", tail_file(log_file), height=280)
         st.caption(log_file)
@@ -339,5 +411,6 @@ with st.expander("📜 Logs", expanded=False):
 # Footer
 # =========================
 st.markdown("---")
-st.caption("Created by @effands with Ai | ziqva.com - since agust 2025. CP 0856 4990 5055")
+st.caption("Created by @effands with Ai | ziqva.com - @2025")
+st.captioon("kontak : 0856 4990 5055")
 st.caption(f"Terakhir diupdate: {datetime.now().strftime('%d %B %Y %H:%M:%S')}")
