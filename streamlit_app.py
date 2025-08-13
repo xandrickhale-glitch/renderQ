@@ -9,6 +9,8 @@
 import os
 import time
 import json
+import base64
+import uuid
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
@@ -42,6 +44,7 @@ details > summary {
 h1, h2, h3 { margin-bottom: .4rem; }
 .small-note { opacity:.7; font-size:.9rem; }
 .cardpad { padding: 4px 6px 2px 6px; }
+.badge { display:inline-block; padding:2px 6px; border-radius:8px; background:#eee; font-size:.8rem; margin-left:6px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -51,9 +54,14 @@ st.title("🎬 RenderX Veo Gemini")
 # Session Defaults
 # =========================
 if "prompts" not in st.session_state:
+    # list of dicts: {"id": str, "text": str}
     st.session_state.prompts = []
 if "results" not in st.session_state:
     st.session_state.results = []
+if "downloaded_files" not in st.session_state:
+    st.session_state.downloaded_files = set()
+if "multi_input" not in st.session_state:
+    st.session_state.multi_input = ""
 
 # =========================
 # Logging
@@ -96,9 +104,11 @@ with colL:
     with st.expander("🔑 API & Output", expanded=True):
         api_key = st.text_input("Gemini API Key (format AIza…)", type="password")
         default_out = os.path.join(os.path.expanduser("~"), "Downloads", "VEO_OUTPUT")
-        output_folder = st.text_input("Folder output", value=default_out)
+        output_folder = st.text_input("Folder output (server)", value=default_out)
         os.makedirs(output_folder, exist_ok=True)
 
+        auto_download = st.toggle("Auto-download ke browser setelah render", value=False,
+                                  help="Jika aktif, file MP4 akan langsung diunduh oleh browser (data URL).")
         use_file_log = st.toggle("Aktifkan file log", value=True)
         log_level = st.selectbox("Level Log", ["INFO", "DEBUG", "WARNING", "ERROR"], index=0)
         log_file = os.path.join(output_folder, "veo_gemini_advanced.log") if use_file_log else None
@@ -108,25 +118,37 @@ with colL:
 
 with colR:
     with st.expander("🎛️ Model & Parameters", expanded=True):
-        model = st.selectbox(
-            "Model",
-            [
-                "veo-3.0-fast-generate-preview",  # cepat, 8s, 16:9, audio on
-                "veo-3.0-generate-preview",       # 8s, 16:9, audio on
-                "veo-2.0-generate-001",           # 5–8s, 16:9/9:16, silent
-            ],
-            index=0
-        )
+        # Pilih keluarga model dulu
+        family = st.radio("Pilih Keluarga Model", ["Veo 3", "Veo 2"], index=0, horizontal=True)
 
-        # Aspect ratio & duration rules
-        if model.startswith("veo-3."):
-            aspect_ratio = st.selectbox("Aspect Ratio", ["16:9"], index=0)
-            st.markdown('<div class="small-note">Veo 3 preview: 16:9 & 8 detik (audio on).</div>', unsafe_allow_html=True)
+        if family == "Veo 3":
+            model = st.selectbox(
+                "Model (Veo 3)",
+                [
+                    "veo-3.0-fast-generate-preview",  # cepat, 8s, 16:9, audio on
+                    "veo-3.0-generate-preview",       # 8s, 16:9, audio on
+                ],
+                index=0
+            )
+            # Veo 3: fixed controls
+            aspect_ratio = "16:9"
             duration_seconds = 8
+            st.markdown('<div class="small-note">Veo 3 preview: 16:9 & 8 detik (audio on). Durasi & aspect ratio dikunci.</div>', unsafe_allow_html=True)
+
         else:
+            model = st.selectbox(
+                "Model (Veo 2)",
+                [
+                    "veo-2.0-generate-001",           # 5–8s, 16:9/9:16, silent
+                ],
+                index=0
+            )
+            # Veo 2: user can choose AR & duration
             aspect_ratio = st.selectbox("Aspect Ratio (Veo 2)", ["16:9", "9:16"], index=0)
             duration_seconds = st.selectbox("Durasi (detik, Veo 2)", [5, 6, 7, 8], index=3)
+            st.markdown('<div class="small-note">Veo 2: silent, mendukung 16:9 & 9:16, durasi 5–8 detik.</div>', unsafe_allow_html=True)
 
+        # Opsi umum (berlaku untuk keduanya)
         c1, c2 = st.columns(2, gap="small")
         with c1:
             negative_prompt = st.text_input("Negative Prompt (opsional)", value="")
@@ -141,33 +163,67 @@ with colR:
                 person_generation = None
 
 # =========================
-# Prompts (Full width, compact)
+# Prompts (Add / Manage)
 # =========================
 with st.expander("📝 Prompts", expanded=True):
     cA, cB = st.columns([2, 1], gap="small")
     with cA:
-        multi = st.text_area("Tambahkan beberapa prompt (1 baris = 1 prompt)", height=160, placeholder="Contoh: An ultra wide cinematic shot of ...")
-        if st.button("➕ Tambah dari teks di atas"):
-            lines = [l.strip() for l in multi.splitlines() if l.strip()]
-            st.session_state.prompts.extend(lines)
-            st.success(f"Ditambahkan {len(lines)} prompt.")
+        st.session_state.multi_input = st.text_area(
+            "Tambahkan beberapa prompt (1 baris = 1 prompt)",
+            key="multi_input",
+            height=160,
+            placeholder="Contoh: An ultra wide cinematic shot of ..."
+        )
+        if st.button("➕ Tambah dari teks di atas", key="btn_add_from_text"):
+            lines = [l.strip() for l in st.session_state.multi_input.splitlines() if l.strip()]
+            if lines:
+                st.session_state.prompts.extend([{"id": uuid.uuid4().hex, "text": l} for l in lines])
+                st.session_state.multi_input = ""  # CLEAR setelah ditambahkan
+                st.success(f"Ditambahkan {len(lines)} prompt.")
 
     with cB:
         txt = st.file_uploader("Upload .txt (1/baris)", type=["txt"])
-        if txt:
+        if txt and st.button("📥 Tambah dari file .txt", key="btn_add_from_file"):
             lines = txt.read().decode("utf-8", errors="ignore").splitlines()
             lines = [l.strip() for l in lines if l.strip()]
-            st.session_state.prompts.extend(lines)
-            st.success(f"Ditambahkan {len(lines)} prompt dari file.")
-        if st.button("🧹 Bersihkan semua prompt"):
+            if lines:
+                st.session_state.prompts.extend([{"id": uuid.uuid4().hex, "text": l} for l in lines])
+                st.success(f"Ditambahkan {len(lines)} prompt dari file.")
+
+        if st.button("🧹 Bersihkan semua prompt", key="btn_clear_all"):
             st.session_state.prompts = []
             st.success("Prompt dibersihkan.")
 
+    # Daftar + Edit/Delete
+    st.markdown("---")
+    st.caption(f"Total prompt: {len(st.session_state.prompts)}")
     if st.session_state.prompts:
-        st.caption(f"Total prompt: {len(st.session_state.prompts)}")
+        with st.expander("🛠️ Kelola Prompt (Edit / Delete)", expanded=False):
+            # Tampilkan editor per prompt
+            to_delete = []
+            for idx, item in enumerate(st.session_state.prompts, start=1):
+                pid = item["id"]
+                with st.container():
+                    c1, c2 = st.columns([4, 1], gap="small")
+                    with c1:
+                        new_text = st.text_area(f"{idx}.", value=item["text"], key=f"edit_{pid}", height=70)
+                    with c2:
+                        save_key = f"save_{pid}"
+                        del_key = f"del_{pid}"
+                        if st.button("💾 Save", key=save_key, use_container_width=True):
+                            item["text"] = new_text
+                            st.success("Tersimpan.")
+                        if st.button("🗑️ Delete", key=del_key, type="secondary", use_container_width=True):
+                            to_delete.append(pid)
+                    st.markdown("<hr>", unsafe_allow_html=True)
+            if to_delete:
+                st.session_state.prompts = [p for p in st.session_state.prompts if p["id"] not in to_delete]
+                st.success(f"Dihapus {len(to_delete)} prompt.")
+
+        # Ringkas tampilan list
         with st.container():
-            for i, p in enumerate(st.session_state.prompts, start=1):
-                st.text(f"{i}. {p}")
+            show_list = "\n".join([f"{i+1}. {p['text']}" for i, p in enumerate(st.session_state.prompts)])
+            st.text(show_list)
 
 # =========================
 # Gemini REST Helpers
@@ -314,6 +370,32 @@ def download_video_by_uri(api_key: str, uri: str, out_path: str) -> tuple[bool, 
         logger.exception(f"Download EXCEPTION: {e}")
         return False, str(e)
 
+def trigger_browser_download(path: str, download_name: str):
+    """
+    Auto-trigger browser download using a data URL + JS (works without clicking).
+    NOTE: For file besar, ini akan memori berat (base64). Cocok untuk video 5–8 detik.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode("utf-8")
+        href = f"data:video/mp4;base64,{b64}"
+        js = f"""
+        <script>
+        (function(){{
+            const a = document.createElement('a');
+            a.href = "{href}";
+            a.download = "{download_name}";
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }})();
+        </script>
+        """
+        st.markdown(js, unsafe_allow_html=True)
+    except Exception as e:
+        st.warning(f"Gagal auto-download: {e}")
+
 # =========================
 # Run Row & Results
 # =========================
@@ -332,7 +414,8 @@ with st.expander("🚀 Jalankan & Hasil", expanded=True):
         else:
             st.session_state.results = []
             status = st.empty()
-            for i, prompt in enumerate(st.session_state.prompts, start=1):
+            for i, item in enumerate(st.session_state.prompts, start=1):
+                prompt = item["text"]
                 status.text(f"Mulai job {i}/{len(st.session_state.prompts)} …")
                 logger.info(f"=== JOB {i} START ===")
                 ok, op_or_err = start_generation(
@@ -375,12 +458,17 @@ with st.expander("🚀 Jalankan & Hasil", expanded=True):
                     st.success(f"✅ Video {i} tersimpan: {out_path}")
                     st.video(out_path)
 
-                    # Optional: client download button (useful if app berjalan di server)
+                    # Optional: client download button (selalu ada)
                     try:
                         with open(out_path, "rb") as f:
-                            st.download_button("⬇️ Download MP4", f, file_name=os.path.basename(out_path), mime="video/mp4", key=f"dl_{i}_{ts}")
+                            st.download_button("⬇️ Download MP4", f, file_name=fname, mime="video/mp4", key=f"dl_{i}_{ts}")
                     except Exception as e:
                         logger.warning(f"Gagal membuat tombol download: {e}")
+
+                    # Auto-download ke browser jika diaktifkan, dan belum pernah di-trigger untuk file ini
+                    if auto_download and out_path not in st.session_state.downloaded_files:
+                        trigger_browser_download(out_path, fname)
+                        st.session_state.downloaded_files.add(out_path)
 
                     st.session_state.results.append({"index": i, "status": "OK", "info": out_path, "prompt": prompt})
                 else:
@@ -400,7 +488,8 @@ with st.expander("🚀 Jalankan & Hasil", expanded=True):
 # Logs (Collapsed by default)
 # =========================
 with st.expander("📜 Logs", expanded=False):
-    if 'use_file_log' in locals() and use_file_log and log_file and os.path.exists(log_file):
+    log_file_exists = 'use_file_log' in locals() and use_file_log and log_file and os.path.exists(log_file)
+    if log_file_exists:
         if st.button("Muat Log Terbaru"):
             st.text_area("Tail Log", tail_file(log_file), height=280)
         st.caption(log_file)
@@ -411,6 +500,5 @@ with st.expander("📜 Logs", expanded=False):
 # Footer
 # =========================
 st.markdown("---")
-st.caption("Created by @effands with Ai | ziqva.com - @2025")
-st.caption("kontak : 0856 4990 5055")
+st.caption("Created by @effands with Ai | ziqva.com - since agust 2025. CP 0856 4990 5055")
 st.caption(f"Terakhir diupdate: {datetime.now().strftime('%d %B %Y %H:%M:%S')}")
