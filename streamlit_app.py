@@ -20,7 +20,7 @@ import streamlit as st
 # =========================
 # Page & Global Config
 # =========================
-st.set_page_config(page_title="RenderX Veo", layout="wide")
+st.set_page_config(page_title="RenderX Veo Gemini", layout="wide")
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 # Compact CSS + thin outline for groups
@@ -45,7 +45,7 @@ h1, h2, h3 { margin-bottom: .4rem; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎬 RenderX Veo")
+st.title("🎬 RenderX Veo Gemini")
 
 # =========================
 # Session Defaults
