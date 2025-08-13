@@ -3,7 +3,7 @@ Advanced Streamlit app to batch-generate Veo 2 / Veo 3 videos using the Gemini A
 Supports long-running operations (predict → poll) and auto-downloads MP4 results.
 
 Author: effands — ziqva.com
-Contact: 085649905055
+Contact: +62856 4990 5055
 
 ✨ Features
 API key only (header x-goog-api-key) — no OAuth/Service Account.
