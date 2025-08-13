@@ -2,16 +2,18 @@
 # Streamlit • Veo 2 / Veo 3 via Gemini API (API key only)
 # - Prompt manager (Add / Edit / Delete)
 # - Veo 2 vs Veo 3 controls (AR/duration for Veo2; fixed for Veo3)
-# - Batch, LRO polling, MP4 save, preview, auto-download
+# - Batch, LRO polling, MP4 save, preview
+# - Auto-download (JS component), per-item download, Download All (ZIP)
 # pip install streamlit requests
 
-import os, time, json, base64, uuid, logging
+import os, time, json, base64, uuid, logging, io, zipfile
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # =========================
 # Page & Global Config
@@ -19,7 +21,7 @@ import streamlit as st
 st.set_page_config(page_title="RenderX Veo Gemini", layout="wide")
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
-# Compact CSS + thin outline for groups
+# Compact CSS
 st.markdown("""
 <style>
 :root { --card-border-light: rgba(0,0,0,.12); --card-border-dark: rgba(255,255,255,.15); }
@@ -31,6 +33,7 @@ details > summary { font-weight: 600; font-size: 0.95rem; margin-bottom: 6px; cu
 h1, h2, h3 { margin-bottom: .4rem; }
 .small-note { opacity:.7; font-size:.9rem; }
 .cardpad { padding: 4px 6px 2px 6px; }
+hr { border: 0; border-top: 1px solid rgba(127,127,127,.2); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -40,32 +43,30 @@ st.title("🎬 RenderX Veo Gemini")
 # Session Defaults
 # =========================
 if "prompts" not in st.session_state:
-    st.session_state.prompts = []            # list of dicts: {"id": str, "text": str}
+    st.session_state.prompts = []  # list[{"id": str, "text": str}]
 if "results" not in st.session_state:
+    # list[{"id", "index", "status", "path", "fname", "prompt", "auto_done"}]
     st.session_state.results = []
 if "downloaded_files" not in st.session_state:
     st.session_state.downloaded_files = set()
-# IMPORTANT: set default BEFORE widget is instantiated
 st.session_state.setdefault("multi_input", "")
 st.session_state.setdefault("add_msg", None)
+st.session_state.setdefault("auto_enabled", False)   # mirror toggle state across reruns
+st.session_state.setdefault("auto_last_id", None)    # prevent multiple triggers same run
 
 # =========================
 # Logging
 # =========================
 def setup_logger(log_path: str | None, level=logging.INFO):
     logger = logging.getLogger("veo_gemini_adv")
-    logger.setLevel(level)
-    logger.propagate = False
-    if logger.handlers:
-        return logger
+    logger.setLevel(level); logger.propagate = False
+    if logger.handlers: return logger
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    ch = logging.StreamHandler(); ch.setFormatter(fmt); ch.setLevel(level)
-    logger.addHandler(ch)
+    ch = logging.StreamHandler(); ch.setFormatter(fmt); ch.setLevel(level); logger.addHandler(ch)
     if log_path:
         try:
             fh = RotatingFileHandler(log_path, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
-            fh.setFormatter(fmt); fh.setLevel(level)
-            logger.addHandler(fh)
+            fh.setFormatter(fmt); fh.setLevel(level); logger.addHandler(fh)
         except Exception as e:
             st.warning(f"⚠️ Log file gagal dibuat: {e}")
     return logger
@@ -91,8 +92,14 @@ with colL:
         output_folder = st.text_input("Folder output (server)", value=default_out)
         os.makedirs(output_folder, exist_ok=True)
 
-        auto_download = st.toggle("Auto-download ke browser setelah render", value=False,
-                                  help="Jika aktif, file MP4 akan langsung diunduh oleh browser (data URL).")
+        auto_download = st.toggle(
+            "Auto-download ke browser setelah render (eksperimen)",
+            value=st.session_state["auto_enabled"],
+            help="Akan mencoba mengunduh otomatis 1 file per rerun via JavaScript. "
+                 "Beberapa browser bisa memblokir pop-up/auto-download."
+        )
+        st.session_state["auto_enabled"] = auto_download
+
         use_file_log = st.toggle("Aktifkan file log", value=True)
         log_level = st.selectbox("Level Log", ["INFO", "DEBUG", "WARNING", "ERROR"], index=0)
         log_file = os.path.join(output_folder, "veo_gemini_advanced.log") if use_file_log else None
@@ -131,14 +138,14 @@ with colR:
                 person_generation = None
 
 # =========================
-# Callbacks (fix Streamlit state rules)
+# Callbacks
 # =========================
 def add_from_text_cb():
     raw = st.session_state.get("multi_input", "")
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
     if lines:
         st.session_state.prompts.extend([{"id": uuid.uuid4().hex, "text": l} for l in lines])
-        st.session_state["multi_input"] = ""             # safe: inside callback
+        st.session_state["multi_input"] = ""  # safe inside callback
         st.session_state["add_msg"] = f"Ditambahkan {len(lines)} prompt."
 
 # =========================
@@ -153,11 +160,9 @@ with st.expander("📝 Prompts", expanded=True):
             height=160,
             placeholder="Contoh: An ultra wide cinematic shot of ..."
         )
-        # ⬇️ Clear & add via callback to avoid modification-after-instantiation error
         st.button("➕ Tambah dari teks di atas", key="btn_add_from_text", on_click=add_from_text_cb)
         if st.session_state.get("add_msg"):
-            st.success(st.session_state["add_msg"])
-            st.session_state["add_msg"] = None
+            st.success(st.session_state["add_msg"]); st.session_state["add_msg"] = None
 
     with cB:
         txt = st.file_uploader("Upload .txt (1/baris)", type=["txt"])
@@ -185,8 +190,7 @@ with st.expander("📝 Prompts", expanded=True):
                         new_text = st.text_area(f"{idx}.", value=item["text"], key=f"edit_{pid}", height=70)
                     with c2:
                         if st.button("💾 Save", key=f"save_{pid}", use_container_width=True):
-                            item["text"] = new_text
-                            st.success("Tersimpan.")
+                            item["text"] = new_text; st.success("Tersimpan.")
                         if st.button("🗑️ Delete", key=f"del_{pid}", type="secondary", use_container_width=True):
                             to_delete.append(pid)
                     st.markdown("<hr>", unsafe_allow_html=True)
@@ -237,26 +241,22 @@ def poll_operation(api_key: str, operation_name: str, timeout: int = 900, every:
         try:
             r = requests.get(url, headers=headers, timeout=60)
         except Exception as e:
-            logger.error(f"Poll EXCEPTION: {e}")
-            progress.empty(); return False, f"Exception: {e}"
+            logger.error(f"Poll EXCEPTION: {e}"); progress.empty(); return False, f"Exception: {e}"
         if r.status_code != 200:
-            logger.error(f"Poll FAIL {r.status_code}: {r.text}")
-            progress.empty(); return False, f"{r.status_code}: {r.text}"
+            logger.error(f"Poll FAIL {r.status_code}: {r.text}"); progress.empty(); return False, f"{r.status_code}: {r.text}"
         j = r.json()
         if j.get("done"):
-            logger.info("Poll DONE")
-            progress.progress(100, text="Selesai."); time.sleep(0.25); progress.empty()
+            logger.info("Poll DONE"); progress.progress(100, text="Selesai."); time.sleep(0.25); progress.empty()
             return True, j
         elapsed = time.time() - start
         pct = min(int((elapsed / timeout) * 100), 99)
         progress.progress(pct, text=f"Polling… ({pct}%)")
         logger.debug(f"Poll running… elapsed={int(elapsed)}s")
         if elapsed > timeout:
-            logger.error("Poll TIMEOUT")
-            progress.empty(); return False, "Timeout polling operation."
+            logger.error("Poll TIMEOUT"); progress.empty(); return False, "Timeout polling operation."
         time.sleep(every)
 
-# ---------- URI helpers (fix for redirects/auth) ----------
+# ---------- URI helpers ----------
 def _append_key(u: str, key: str) -> str:
     parts = list(urlparse(u))
     q = dict(parse_qsl(parts[4])); q["key"] = key
@@ -301,30 +301,39 @@ def download_video_by_uri(api_key: str, uri: str, out_path: str) -> tuple[bool, 
         logger.exception(f"Download EXCEPTION: {e}")
         return False, str(e)
 
+# ---------- Auto-download component ----------
 def trigger_browser_download(path: str, download_name: str):
+    """
+    Auto-trigger browser download using a data URL via a JS component.
+    Browser bisa memblokir auto-download; ini best-effort.
+    """
     try:
         with open(path, "rb") as f:
             data = f.read()
         b64 = base64.b64encode(data).decode("utf-8")
-        href = f"data:video/mp4;base64,{b64}"
-        st.markdown(f"""
-        <script>(function(){{
-            var a=document.createElement('a'); a.href="{href}"; a.download="{download_name}";
-            document.body.appendChild(a); a.click(); document.body.removeChild(a);
-        }})();</script>
-        """, unsafe_allow_html=True)
+        html = f"""
+        <html><body>
+        <a id="d" href="data:video/mp4;base64,{b64}" download="{download_name}"></a>
+        <script>
+          // auto click once
+          const a = document.getElementById('d');
+          setTimeout(()=>{{ a.click(); }}, 50);
+        </script>
+        </body></html>
+        """
+        components.html(html, height=0)
     except Exception as e:
         st.warning(f"Gagal auto-download: {e}")
 
 # =========================
-# Run Row & Results
+# Run Row (Generate)
 # =========================
-with st.expander("🚀 Jalankan & Hasil", expanded=True):
+with st.expander("🚀 Jalankan Batch", expanded=True):
     runL, runR = st.columns([1, 3], gap="small")
     with runL:
         go = st.button("🎬 Generate Batch", use_container_width=True)
     with runR:
-        st.caption("Video akan diunduh & dipreview otomatis. Lihat log jika ada error.")
+        st.caption("Video akan diunduh ke folder server & ditambahkan ke daftar hasil di bawah. Lihat log jika ada error.")
 
     if go:
         if not api_key:
@@ -332,7 +341,10 @@ with st.expander("🚀 Jalankan & Hasil", expanded=True):
         elif not st.session_state.prompts:
             st.error("Tambah minimal 1 prompt.")
         else:
-            st.session_state.results = []
+            # Kosongkan hasil LAMA? → TIDAK. Biarkan persist supaya tidak hilang saat klik tombol lain.
+            # Jika ingin reset, aktifkan baris berikut:
+            # st.session_state.results = []
+
             status = st.empty()
             for i, item in enumerate(st.session_state.prompts, start=1):
                 prompt = item["text"]
@@ -347,21 +359,30 @@ with st.expander("🚀 Jalankan & Hasil", expanded=True):
                 )
                 if not ok:
                     st.error(f"Kickoff gagal: {op_or_err}")
-                    st.session_state.results.append({"index": i, "status": "ERROR", "info": op_or_err, "prompt": prompt})
+                    st.session_state.results.append({
+                        "id": uuid.uuid4().hex, "index": i, "status": "ERROR",
+                        "path": "", "fname": "", "prompt": prompt, "auto_done": True
+                    })
                     logger.info(f"=== JOB {i} END (kickoff error) ===")
                     continue
 
                 ok, resp = poll_operation(api_key, op_or_err, timeout=900, every=5)
                 if not ok:
                     st.error(f"Gagal polling: {resp}")
-                    st.session_state.results.append({"index": i, "status": "ERROR", "info": str(resp), "prompt": prompt})
+                    st.session_state.results.append({
+                        "id": uuid.uuid4().hex, "index": i, "status": "ERROR",
+                        "path": "", "fname": "", "prompt": prompt, "auto_done": True
+                    })
                     logger.info(f"=== JOB {i} END (poll error) ===")
                     continue
 
                 uri = extract_video_uri(resp)
                 if not uri:
                     st.error("Respon selesai tapi tidak ada URI video yang bisa diunduh.")
-                    st.session_state.results.append({"index": i, "status": "ERROR", "info": "No URI in response", "prompt": prompt})
+                    st.session_state.results.append({
+                        "id": uuid.uuid4().hex, "index": i, "status": "ERROR",
+                        "path": "", "fname": "", "prompt": prompt, "auto_done": True
+                    })
                     logger.info(f"=== JOB {i} END (no uri) ===")
                     continue
 
@@ -372,31 +393,97 @@ with st.expander("🚀 Jalankan & Hasil", expanded=True):
                 ok, msg = download_video_by_uri(api_key, uri, out_path)
                 if ok:
                     st.success(f"✅ Video {i} tersimpan: {out_path}")
-                    st.video(out_path)
-                    try:
-                        with open(out_path, "rb") as f:
-                            st.download_button("⬇️ Download MP4", f, file_name=fname, mime="video/mp4", key=f"dl_{i}_{ts}")
-                    except Exception as e:
-                        logger.warning(f"Gagal membuat tombol download: {e}")
-                    if auto_download and out_path not in st.session_state.downloaded_files:
-                        trigger_browser_download(out_path, fname)
-                        st.session_state.downloaded_files.add(out_path)
-                    st.session_state.results.append({"index": i, "status": "OK", "info": out_path, "prompt": prompt})
+                    # Masukkan ke daftar hasil (persisten)
+                    st.session_state.results.append({
+                        "id": uuid.uuid4().hex, "index": i, "status": "OK",
+                        "path": out_path, "fname": fname, "prompt": prompt, "auto_done": False
+                    })
                 else:
                     st.error(f"Download gagal: {msg}")
-                    st.session_state.results.append({"index": i, "status": "ERROR", "info": msg, "prompt": prompt})
+                    st.session_state.results.append({
+                        "id": uuid.uuid4().hex, "index": i, "status": "ERROR",
+                        "path": "", "fname": "", "prompt": prompt, "auto_done": True
+                    })
 
                 logger.info(f"=== JOB {i} END ===")
 
             status.empty()
-            st.markdown("---")
-            st.subheader("📊 Ringkasan")
-            for r in st.session_state.results:
-                emoji = "✅" if r["status"] == "OK" else "❌"
-                st.write(f"{r['index']}. {emoji} {r['status']} — {r['info']}")
 
 # =========================
-# Logs (Collapsed by default)
+# Persistent Results Viewer (doesn't disappear on rerun)
+# =========================
+st.markdown("---")
+st.subheader("📼 Rendered Videos (persist)")
+
+# Controls
+cL, cR = st.columns([1, 3], gap="small")
+with cL:
+    if st.button("🗑️ Clear All Results"):
+        st.session_state.results = []
+        st.success("Daftar hasil dikosongkan.")
+with cR:
+    # Download all (ZIP)
+    ok_paths = [r["path"] for r in st.session_state.results if r["status"] == "OK" and r["path"] and os.path.exists(r["path"])]
+    if ok_paths:
+        if st.button("⬇️ Download All (ZIP)"):
+            mem = io.BytesIO()
+            with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for p in ok_paths:
+                    zf.write(p, arcname=os.path.basename(p))
+            mem.seek(0)
+            tszip = datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button("Save ZIP file", mem, file_name=f"veo_batch_{tszip}.zip", mime="application/zip", key=f"zip_{tszip}")
+
+# List items
+remove_ids = []
+for r in st.session_state.results:
+    if r["status"] != "OK":  # tampilkan hanya yang sukses
+        continue
+    vid_id = r["id"]; path = r["path"]; fname = r["fname"]; prompt = r["prompt"]
+
+    with st.container():
+        st.markdown(f"**{fname}**  \n*{prompt[:120]}{'…' if len(prompt)>120 else ''}*")
+        if path and os.path.exists(path):
+            st.video(path)
+            c1, c2, c3 = st.columns([1,1,1], gap="small")
+            with c1:
+                # per-item download button (stable key)
+                try:
+                    with open(path, "rb") as f:
+                        st.download_button("⬇️ Download MP4", f, file_name=fname, mime="video/mp4", key=f"dl_{vid_id}")
+                except Exception as e:
+                    st.warning(f"Gagal membuat tombol download: {e}")
+            with c2:
+                if st.button("🗑️ Remove from list", key=f"rm_{vid_id}"):
+                    remove_ids.append(vid_id)
+            with c3:
+                st.caption(path)
+        else:
+            st.error("File tidak ditemukan di server.")
+        st.markdown("<hr>", unsafe_allow_html=True)
+
+# Apply removals
+if remove_ids:
+    st.session_state.results = [x for x in st.session_state.results if x["id"] not in remove_ids]
+    st.success(f"Dihapus {len(remove_ids)} item dari daftar.")
+
+# =========================
+# Auto-download queue (best-effort, 1 file per rerun)
+# =========================
+if st.session_state["auto_enabled"]:
+    # pilih 1 file yang belum auto_done
+    pending = next((x for x in st.session_state.results
+                    if x["status"] == "OK" and not x.get("auto_done", False)
+                    and x["path"] and os.path.exists(x["path"])), None)
+    if pending and st.session_state.get("auto_last_id") != pending["id"]:
+        trigger_browser_download(pending["path"], pending["fname"])
+        # tandai sebagai selesai supaya tidak berulang
+        pending["auto_done"] = True
+        st.session_state["auto_last_id"] = pending["id"]
+        st.info(f"Mencoba auto-download: {pending['fname']} (jika diblokir browser, gunakan tombol Download MP4).")
+
+# =========================
+# Logs
 # =========================
 with st.expander("📜 Logs", expanded=False):
     log_file_path = locals().get("log_file")
